@@ -9,6 +9,7 @@
 #include <yaml-cpp/yaml.h>
 
 using ReplacementRules = std::map<std::string, std::map<std::string, std::shared_ptr<IRule>>>;
+using ReplacementCatalog = std::map<std::string, std::vector<std::string>>;
 
 class DataProcessor
 {
@@ -19,6 +20,7 @@ class DataProcessor
 
   private:
     YAML::Node config_;
+    ReplacementCatalog replacement_catalog_;
     ReplacementRules replacement_rules_;
 
     enum class ParserState
@@ -27,6 +29,7 @@ class DataProcessor
         ReadingData
     };
 
+    ReplacementCatalog load_catalog(const YAML::Node &config);
     ReplacementRules load_rules(const YAML::Node &config) const;
     void parse_copy_columns(const std::string &raw_columns, std::vector<std::string> &columns) const;
 };

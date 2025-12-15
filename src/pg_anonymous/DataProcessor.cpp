@@ -3,6 +3,7 @@
 #include <fstream>
 #include <regex>
 #include <sstream>
+#include <string>
 
 void DataProcessor::parse_copy_columns(const std::string &raw_columns, std::vector<std::string> &columns) const
 {
@@ -30,11 +31,35 @@ DataProcessor::DataProcessor(const std::string &config_file_path)
     {
         config_ = YAML::LoadFile(config_file_path);
         replacement_rules_ = load_rules(config_);
+        replacement_catalog_ = load_catalog(config_);
     }
     catch (const std::exception &e)
     {
         std::cerr << "Initialization Error: " << e.what() << std::endl;
     }
+}
+
+ReplacementCatalog DataProcessor::load_catalog(const YAML::Node &config)
+{
+    ReplacementCatalog catalog;
+
+    if (!config["catalog"] || !config["catalog"].IsMap())
+        return catalog;
+
+    const YAML::Node &catalog_node = config["catalog"];
+
+    for (auto category_it = catalog_node.begin(); category_it != catalog_node.end(); ++category_it)
+    {
+        std::string category_name = category_it->first.as<std::string>();
+        const YAML::Node &category_node = category_it->second;
+
+        if (!category_node.IsSequence())
+            continue;
+
+        catalog.emplace(category_name, category_node.as<std::vector<std::string>>());
+    }
+
+    return catalog;
 }
 
 ReplacementRules DataProcessor::load_rules(const YAML::Node &config) const
@@ -68,7 +93,7 @@ ReplacementRules DataProcessor::load_rules(const YAML::Node &config) const
                         std::string col = rule_it->first.as<std::string>();
                         std::string raw_template = rule_it->second.as<std::string>();
 
-                        rules[table_name][col] = RuleFactory::parse_template(raw_template);
+                        rules[table_name][col] = RuleFactory::parse_template(raw_template, replacement_catalog_);
 
                         std::cout << "Loaded rule for " << table_name << "." << col << ": " << raw_template << "\n";
                     }

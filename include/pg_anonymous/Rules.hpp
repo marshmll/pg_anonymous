@@ -65,7 +65,7 @@ class StaticTextRule : public IRule
 };
 
 /**
- * @brief Generates a random integer. Usage: {{RAND(min, max)}}
+ * @brief Generates a random integer. Usage: {{rand(min, max)}}
  */
 class RandomIntRule : public IRule
 {
@@ -84,7 +84,7 @@ class RandomIntRule : public IRule
 };
 
 /**
- * @brief Selects a random option from a list. Usage: {{PICK(A, B, C)}}
+ * @brief Selects a random option from a list. Usage: {{pick(A, B, C)}}
  */
 class PickRule : public IRule
 {
@@ -104,17 +104,53 @@ class PickRule : public IRule
     }
 };
 
+class PickFromCatalogRule : public IRule
+{
+    const std::map<std::string, std::vector<std::string>> &catalog_;
+    std::string key_;
+    std::shared_ptr<IRule> identity_value_rule_;
+    std::hash<std::string> hash_function_;
+
+  public:
+    explicit PickFromCatalogRule(const std::map<std::string, std::vector<std::string>> &catalog, std::string key,
+                                 std::shared_ptr<IRule> identity_value_rule)
+        : catalog_(catalog), key_(key), identity_value_rule_(identity_value_rule)
+    {
+    }
+    std::string apply(const std::string &original_value, const RowContext &context) override
+    {
+        if (!catalog_.contains(key_))
+            return "";
+
+        const std::vector<std::string> &options = catalog_.at(key_);
+
+        if (options.empty())
+            return "";
+
+        // Create deterministic seed from key + identity
+        const std::string identity_value = identity_value_rule_->apply(original_value, context);
+        std::string seed_str = key_ + identity_value;
+        size_t seed = std::hash<std::string>{}(seed_str);
+
+        // Use a deterministic PRNG
+        std::mt19937_64 rng(seed);
+        std::uniform_int_distribution<size_t> dist(0, options.size() - 1);
+
+        return options.at(dist(rng));
+    }
+};
+
 /**
  * @brief Applies a Regex replacement to the ORIGINAL value.
- * Usage: {{REGEX(pattern, replacement)}}
+ * Usage: {{regex_replace(pattern, replacement)}}
  */
-class RegexRule : public IRule
+class RegexReplaceRule : public IRule
 {
     std::regex pattern_;
     std::shared_ptr<IRule> replacement_rule_;
 
   public:
-    RegexRule(const std::string &pattern, std::shared_ptr<IRule> replacement_rule)
+    RegexReplaceRule(const std::string &pattern, std::shared_ptr<IRule> replacement_rule)
         : pattern_(pattern), replacement_rule_(std::move(replacement_rule))
     {
     }
@@ -155,9 +191,35 @@ class HashRule : public IRule
     }
 };
 
+class MatchGroupRule : public IRule
+{
+    std::string target_col_;
+    std::regex pattern_;
+    int group_;
+    std::smatch matches_;
+
+  public:
+    MatchGroupRule(std::string col, const std::string &pattern, const std::string &group)
+        : target_col_(std::move(col)), pattern_(pattern), group_(std::stoi(group))
+    {
+    }
+
+    std::string apply(const std::string &, const RowContext &context) override
+    {
+        std::string actual_val = context.get_column_value(target_col_);
+
+        if (std::regex_match(actual_val, matches_, pattern_))
+        {
+            return matches_[group_].str();
+        }
+
+        return "";
+    }
+};
+
 /**
  * @brief Checks if a target column's value matches a regex pattern.
- * Usage: {{MATCHES(column_name, pattern)}}. Returns "true" or "false".
+ * Usage: {{matches(column_name, pattern)}}. Returns "true" or "false".
  */
 class MatchesRule : public IRule
 {
@@ -182,7 +244,6 @@ class MatchesRule : public IRule
 
 class ConditionalRule : public IRule
 {
-    // FIX: Changed from std::string target_col_ to an IRule to allow nested evaluation
     std::shared_ptr<IRule> condition_check_rule_;
     std::string op_;
     std::string target_val_;
@@ -202,15 +263,15 @@ class ConditionalRule : public IRule
         std::string actual_val = condition_check_rule_->apply(original_value, context);
         bool match = false;
 
-        if (op_ == "EQ")
+        if (op_ == "eq")
         {
             match = (actual_val == target_val_);
         }
-        else if (op_ == "NEQ")
+        else if (op_ == "neq")
         {
             match = (actual_val != target_val_);
         }
-        else if (op_ == "IN")
+        else if (op_ == "in")
         {
             std::string args = target_val_;
             std::stringstream ss(args);
@@ -266,7 +327,8 @@ class RuleFactory
     /**
      * @brief Parses template strings using a generic brace counter to support nesting.
      */
-    static std::shared_ptr<IRule> parse_template(const std::string &raw_template)
+    static std::shared_ptr<IRule> parse_template(
+        const std::string &raw_template, const std::map<std::string, std::vector<std::string>> &replacement_catalog)
     {
         auto composite = std::make_shared<CompositeRule>();
         size_t len = raw_template.length();
@@ -300,7 +362,7 @@ class RuleFactory
                     if (depth == 0)
                     {
                         std::string content = raw_template.substr(start_content, j - 1 - start_content);
-                        composite->add_rule(create_func_rule(content));
+                        composite->add_rule(create_func_rule(content, replacement_catalog));
 
                         i = j + 1;
                         last_pos = i;
@@ -332,7 +394,8 @@ class RuleFactory
     }
 
   private:
-    static std::shared_ptr<IRule> create_func_rule(const std::string &func_def)
+    static std::shared_ptr<IRule> create_func_rule(
+        const std::string &func_def, const std::map<std::string, std::vector<std::string>> &replacement_catalog)
     {
         // 1. Extract Name
         size_t paren_start = func_def.find('(');
@@ -354,11 +417,11 @@ class RuleFactory
 
         std::vector<std::string> args = smart_split_args(args_str);
 
-        if (name == "NONE") // NONE rule now takes no arguments and returns NULL marker
+        if (name == "none")
         {
             return std::make_shared<NoneRule>();
         }
-        else if (name == "RAND" && args.size() == 2)
+        else if (name == "rand" && args.size() == 2)
         {
             try
             {
@@ -368,27 +431,46 @@ class RuleFactory
             {
             }
         }
-        else if (name == "HASH" && args.size() == 1)
+        else if (name == "hash" && args.size() == 1)
         {
             unsigned int salt = 0;
             for (char c : args[0])
                 salt = (salt * 31) + (unsigned char)c;
             return std::make_shared<HashRule>(salt);
         }
-        else if (name == "PICK")
+        else if (name == "pick")
         {
             return std::make_shared<PickRule>(args);
         }
-        else if (name == "REGEX" && args.size() >= 2)
+        else if (name == "pick_from_catalog" && args.size() == 2)
         {
-            auto replacement_rule = parse_template(args[1]);
-            return std::make_shared<RegexRule>(args[0], replacement_rule);
+            auto identity_value_rule = parse_template(args[1], replacement_catalog);
+            return std::make_shared<PickFromCatalogRule>(replacement_catalog, args[0], identity_value_rule);
         }
-        else if (name == "LITERAL" && !args.empty())
+        else if (name == "regex_replace" && args.size() >= 2)
+        {
+            auto replacement_rule = parse_template(args[1], replacement_catalog);
+            return std::make_shared<RegexReplaceRule>(args[0], replacement_rule);
+        }
+        else if (name == "literal" && !args.empty())
         {
             return std::make_shared<StaticTextRule>(args[0]);
         }
-        else if (name == "MATCHES" && args.size() == 2)
+        else if (name == "match_group" && args.size() == 3)
+        {
+            try
+            {
+                return std::make_shared<MatchGroupRule>(args[0], args[1], args[2]);
+            }
+            catch (const std::regex_error &e)
+            {
+                std::cerr << "Regex Error in match_group(): " << e.what() << " for pattern: " << args[1] << "\n";
+            }
+            catch (...)
+            {
+            }
+        }
+        else if (name == "matches" && args.size() == 2)
         {
             try
             {
@@ -396,21 +478,21 @@ class RuleFactory
             }
             catch (const std::regex_error &e)
             {
-                std::cerr << "Regex Error in MATCHES: " << e.what() << " for pattern: " << args[1] << "\n";
+                std::cerr << "Regex Error in matches(): " << e.what() << " for pattern: " << args[1] << "\n";
             }
             catch (...)
             {
             }
         }
-        else if (name == "IF" && args.size() == 5)
+        else if (name == "if" && args.size() == 5)
         {
-            auto condition_rule = parse_template(args[0]);
-            auto true_rule = parse_template(args[3]);
-            auto false_rule = parse_template(args[4]);
+            auto condition_rule = parse_template(args[0], replacement_catalog);
+            auto true_rule = parse_template(args[3], replacement_catalog);
+            auto false_rule = parse_template(args[4], replacement_catalog);
             return std::make_shared<ConditionalRule>(condition_rule, args[1], args[2], true_rule, false_rule);
         }
 
-        std::cerr << "Warning: Unknown function or invalid args: " << name << " (Args count: " << args.size() << ")\n";
+        std::cerr << "Warning: Unknown function or invalid args: " << name << " (arg count: " << args.size() << ")\n";
         return std::make_shared<StaticTextRule>("");
     }
 
